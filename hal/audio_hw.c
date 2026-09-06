@@ -980,6 +980,28 @@ static int out_set_volume(struct audio_stream_out *stream __unused, float left _
     return -ENOSYS;
 }
 
+static float get_speaker_boost_factor(void) {
+    static float last_boost = -1.0f;
+    char prop[PROPERTY_VALUE_MAX];
+    float val = 5.0f; // Default 500% (+14 dB)
+    if (property_get("vendor.audio.speaker.boost", prop, NULL) > 0 ||
+        property_get("ro.audio.speaker.boost", prop, NULL) > 0 ||
+        property_get("persist.vendor.audio.speaker.boost", prop, NULL) > 0) {
+        val = (float)atof(prop);
+        if (val >= 20.0f) {
+            val /= 100.0f; // e.g. "500" -> 5.0f
+        }
+        if (val < 0.5f || val > 10.0f) {
+            val = 5.0f;
+        }
+    }
+    if (val != last_boost) {
+        ALOGI("Speaker audio preamp boost factor set to %.2fx (+%.1f dB)", val, 20.0f * log10f(val));
+        last_boost = val;
+    }
+    return val;
+}
+
 static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
                          size_t bytes)
 {
@@ -993,6 +1015,7 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
     int buffer_type;
     int kernel_frames;
     bool sco_on;
+    bool is_speaker;
 
     /*
      * acquiring hw device mutex systematically is useful if a low
@@ -1013,6 +1036,11 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
     buffer_type = (adev->screen_off && !adev->active_in) ?
             OUT_BUFFER_TYPE_LONG : OUT_BUFFER_TYPE_SHORT;
     sco_on = (adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO);
+    is_speaker = (adev->out_device & AUDIO_DEVICE_OUT_SPEAKER) ||
+                 !(adev->out_device & (AUDIO_DEVICE_OUT_WIRED_HEADSET |
+                                       AUDIO_DEVICE_OUT_WIRED_HEADPHONE |
+                                       AUDIO_DEVICE_OUT_ALL_SCO |
+                                       AUDIO_DEVICE_OUT_AUX_DIGITAL));
     pthread_mutex_unlock(&adev->lock);
 
     /* detect changes in screen ON/OFF state and adapt buffer size
@@ -1116,18 +1144,55 @@ static ssize_t out_write(struct audio_stream_out *stream, const void* buffer,
         }
     }
 
+    int16_t *write_buffer = in_buffer;
+    int16_t stack_buf[2048];
+    int16_t *local_buf = NULL;
+
+    if (is_speaker) {
+        float boost = get_speaker_boost_factor();
+        if (boost > 1.01f) {
+            size_t total_samples = out_frames * out->pcm_config.channels;
+            if (total_samples <= 2048) {
+                local_buf = stack_buf;
+            } else {
+                local_buf = (int16_t *)malloc(total_samples * sizeof(int16_t));
+            }
+            if (local_buf) {
+                const int32_t T = 24000;
+                const int32_t M = 32767;
+                const int32_t K = M - T; // 8767
+                for (size_t i = 0; i < total_samples; i++) {
+                    int32_t s = (int32_t)(in_buffer[i] * boost);
+                    if (s > T) {
+                        int32_t e = s - T;
+                        s = T + (K * e) / (K + e);
+                    } else if (s < -T) {
+                        int32_t e = (-s) - T;
+                        s = -(T + (K * e) / (K + e));
+                    }
+                    local_buf[i] = (int16_t)s;
+                }
+                write_buffer = local_buf;
+            }
+        }
+    }
+
     if (out->pcm_config.format == PCM_FORMAT_S32_LE) {
         unsigned int new_buffer_size = out_frames * frame_size * 2;
         uint8_t resize_buffer[new_buffer_size];
-        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_32_BIT, (void*)in_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
+        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_32_BIT, (void*)write_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
         ret = pcm_write(out->pcm, resize_buffer, new_buffer_size);
     } else if(out->pcm_config.format == PCM_FORMAT_S8) {
         unsigned int new_buffer_size = out_frames * frame_size / 2;
         uint8_t resize_buffer[new_buffer_size];
-        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_8_BIT, (void*)in_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
+        memcpy_by_audio_format((void*)resize_buffer, AUDIO_FORMAT_PCM_8_BIT, (void*)write_buffer, AUDIO_FORMAT_PCM_16_BIT, out_frames * frame_size / 2);
         ret = pcm_write(out->pcm, resize_buffer, new_buffer_size);
     } else {
-        ret = pcm_write(out->pcm, in_buffer, out_frames * frame_size);
+        ret = pcm_write(out->pcm, write_buffer, out_frames * frame_size);
+    }
+
+    if (local_buf && local_buf != stack_buf) {
+        free(local_buf);
     }
     if (ret == -EPIPE) {
         /* In case of underrun, don't sleep since we want to catch up asap */
