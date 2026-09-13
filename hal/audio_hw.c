@@ -983,16 +983,16 @@ static int out_set_volume(struct audio_stream_out *stream __unused, float left _
 static float get_speaker_boost_factor(void) {
     static float last_boost = -1.0f;
     char prop[PROPERTY_VALUE_MAX];
-    float val = 5.0f; // Default 500% (+14 dB)
+    float val = 3.0f; // Default 300% (+9.5 dB)
     if (property_get("vendor.audio.speaker.boost", prop, NULL) > 0 ||
         property_get("ro.audio.speaker.boost", prop, NULL) > 0 ||
         property_get("persist.vendor.audio.speaker.boost", prop, NULL) > 0) {
         val = (float)atof(prop);
         if (val >= 20.0f) {
-            val /= 100.0f; // e.g. "500" -> 5.0f
+            val /= 100.0f; // e.g. "300" -> 3.0f
         }
         if (val < 0.5f || val > 10.0f) {
-            val = 5.0f;
+            val = 3.0f;
         }
     }
     if (val != last_boost) {
