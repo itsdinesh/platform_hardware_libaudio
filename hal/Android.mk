@@ -26,6 +26,7 @@ LOCAL_SHARED_LIBRARIES := \
 	libtinyalsa \
 	libaudioutils \
 	libexpat \
+	libm \
 
 LOCAL_SRC_FILES := \
 	audio_hw.c \
